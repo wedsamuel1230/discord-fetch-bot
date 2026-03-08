@@ -1,0 +1,6 @@
+twscrape>=0.17.0
+feedparser>=6.0.12
+httpx>=0.27.0
+# APScheduler 3.x — stable async scheduler (v4 has an incompatible alpha API)
+apscheduler>=3.10.4,<4.0
+pytz>=2024.1
