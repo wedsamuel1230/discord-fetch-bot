@@ -109,5 +109,31 @@ class RssCatalogTests(unittest.TestCase):
             self.assertIn(key, main.RSS_FEEDS)
 
 
+class DigestFormatTests(unittest.TestCase):
+    def test_build_all_embeds_compacts_verbose_ai_bullets_to_one_line(self):
+        topic = {
+            "name": "AI",
+            "emoji": "🤖",
+            "color": 0x5865F2,
+        }
+        verbose_summary = (
+            "• OpenAI 發布新模型，提升推理能力並改善工具呼叫穩定性，"
+            "這對開發者在代理工作流與長任務處理上有直接幫助。\n"
+            "  https://example.com/openai\n"
+            "• GitHub 推出新功能，讓開源專案維護流程更順，"
+            "對持續整合與版本管理有實際影響。 https://example.com/github"
+        )
+
+        embeds = main.build_all_embeds([(topic, verbose_summary)])
+
+        description = embeds[0]["description"]
+        lines = description.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(line.startswith("• ") for line in lines))
+        self.assertIn("https://example.com/openai", lines[0])
+        self.assertIn("https://example.com/github", lines[1])
+        self.assertNotIn("\n  https://example.com/openai", description)
+
+
 if __name__ == "__main__":
     unittest.main()

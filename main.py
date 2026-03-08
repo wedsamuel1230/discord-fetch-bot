@@ -726,6 +726,54 @@ def _raw_fallback(posts: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _compact_summary_for_discord(summary: str, max_body_len: int = 72) -> str:
+    """Normalize AI output into compact one-line bullets for Discord embeds."""
+    if not summary:
+        return ""
+
+    stripped = summary.strip()
+    if stripped in {"NO_CONTENT", ""}:
+        return stripped
+
+    raw_lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    bullets: list[str] = []
+    current = ""
+
+    for line in raw_lines:
+        if line.startswith("•"):
+            if current:
+                bullets.append(current)
+            current = line
+        elif current:
+            current += " " + line
+        else:
+            current = "• " + line
+
+    if current:
+        bullets.append(current)
+
+    compacted: list[str] = []
+    for bullet in bullets:
+        bullet = re.sub(r"\s+", " ", bullet).strip()
+        url_match = re.search(r"https?://\S+", bullet)
+
+        body = bullet[1:].strip() if bullet.startswith("•") else bullet
+        url = ""
+        if url_match:
+            url = url_match.group(0)
+            body = bullet[: url_match.start()].lstrip("•").strip()
+
+        if len(body) > max_body_len:
+            body = body[: max_body_len - 1].rstrip(" ,;:，；：") + "…"
+
+        line = f"• {body}"
+        if url:
+            line = f"{line} {url}"
+        compacted.append(line)
+
+    return "\n".join(compacted)
+
+
 async def ai_filter(
     client: httpx.AsyncClient,
     posts: list[dict[str, Any]],
@@ -754,7 +802,8 @@ async def ai_filter(
         f"- {chip_restriction}"
         "- Remove ads, promotional content, reposts, and off-topic posts.\n"
         "- Keep the best 3–5 posts.\n"
-        "- For each, write 1–2 sentence Traditional Chinese summary followed by URL on the same line.\n"
+        "- For each, write one short Traditional Chinese line in 'why it matters' style, followed by the URL on the same line.\n"
+        "- Keep each line brief and skimmable; do not write full 2-sentence summaries.\n"
         "- Format: one post per line, each starting with • \n"
         "- If no posts are valuable, respond with exactly: NO_CONTENT\n"
         "- Total response must be under 650 characters."
@@ -841,7 +890,7 @@ def _embed_for(topic: dict[str, Any], summary: str) -> dict[str, Any]:
     if not summary or summary.strip() in ("NO_CONTENT", ""):
         description = "⚠️ 今日暫無相關內容"
     else:
-        description = summary[:4096]  # hard Discord per-embed limit
+        description = _compact_summary_for_discord(summary)[:4096]
     return {
         "title": f"{topic['emoji']} {topic['name']} 每日精選",
         "description": description,
@@ -972,79 +1021,116 @@ async def send_init_message(
 
 
 def _git(repo_path: str, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", repo_path, *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", repo_path, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        # git not installed; return a failed CompletedProcess
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=127, stdout="", stderr="git not found in PATH"
+        )
 
 
 def get_repo_tracking(repo_path: str = REPO_PATH) -> tuple[str, str]:
-    branch_result = _git(repo_path, "branch", "--show-current")
-    branch = branch_result.stdout.strip() or os.environ.get("SELF_UPDATE_BRANCH", "main")
+    """Get current branch and remote for repo, with graceful fallback if git unavailable."""
+    try:
+        branch_result = _git(repo_path, "branch", "--show-current")
+        if branch_result.returncode == 0:
+            branch = branch_result.stdout.strip()
+        else:
+            log.warning("Failed to get current git branch: %s", branch_result.stderr)
+            branch = os.environ.get("SELF_UPDATE_BRANCH", "main")
+    except Exception as exc:
+        log.warning("Error querying git: %s; using fallback branch", exc)
+        branch = os.environ.get("SELF_UPDATE_BRANCH", "main")
+    
     remote = os.environ.get("SELF_UPDATE_REMOTE", "origin")
     return branch, remote
 
 
 def check_and_apply_repo_update(repo_path: str = REPO_PATH) -> dict[str, Any]:
-    """Fast-forward local repo to the configured remote branch when safe."""
-    branch, remote = get_repo_tracking(repo_path)
-    dirty_result = _git(repo_path, "status", "--short")
-    dirty = dirty_result.stdout.strip()
-    if dirty:
+    """Fast-forward local repo to the configured remote branch when safe.
+    
+    Gracefully handles git unavailability (returns skipped status).
+    """
+    try:
+        branch, remote = get_repo_tracking(repo_path)
+        dirty_result = _git(repo_path, "status", "--short")
+        
+        # Check if git is available
+        if dirty_result.returncode == 127:  # "command not found"
+            log.warning("Git not available; skipping self-update")
+            return {
+                "status": "skipped",
+                "reason": "git not installed",
+                "branch": branch,
+                "remote": remote,
+            }
+        
+        dirty = dirty_result.stdout.strip()
+        if dirty:
+            return {
+                "status": "skipped",
+                "reason": "working tree is dirty",
+                "branch": branch,
+                "remote": remote,
+            }
+
+        fetch_result = _git(repo_path, "fetch", remote, branch)
+        if fetch_result.returncode != 0:
+            return {
+                "status": "error",
+                "reason": fetch_result.stderr.strip() or "git fetch failed",
+                "branch": branch,
+                "remote": remote,
+            }
+
+        before = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+        after = _git(repo_path, "rev-parse", f"{remote}/{branch}").stdout.strip()
+        if not before or not after:
+            return {
+                "status": "error",
+                "reason": "unable to resolve git revisions",
+                "branch": branch,
+                "remote": remote,
+            }
+        if before == after:
+            return {
+                "status": "up-to-date",
+                "branch": branch,
+                "remote": remote,
+                "before": before,
+                "after": after,
+            }
+
+        pull_result = _git(repo_path, "pull", "--ff-only", remote, branch)
+        if pull_result.returncode != 0:
+            return {
+                "status": "error",
+                "reason": pull_result.stderr.strip() or "git pull failed",
+                "branch": branch,
+                "remote": remote,
+                "before": before,
+                "after": after,
+            }
+
+        return {
+            "status": "updated",
+            "branch": branch,
+            "remote": remote,
+            "before": before,
+            "after": after,
+        }
+    except Exception as exc:
+        log.warning("Unexpected error during repo update: %s; skipping", exc)
         return {
             "status": "skipped",
-            "reason": "working tree is dirty",
-            "branch": branch,
-            "remote": remote,
+            "reason": f"exception: {exc}",
         }
-
-    fetch_result = _git(repo_path, "fetch", remote, branch)
-    if fetch_result.returncode != 0:
-        return {
-            "status": "error",
-            "reason": fetch_result.stderr.strip() or "git fetch failed",
-            "branch": branch,
-            "remote": remote,
-        }
-
-    before = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
-    after = _git(repo_path, "rev-parse", f"{remote}/{branch}").stdout.strip()
-    if not before or not after:
-        return {
-            "status": "error",
-            "reason": "unable to resolve git revisions",
-            "branch": branch,
-            "remote": remote,
-        }
-    if before == after:
-        return {
-            "status": "up-to-date",
-            "branch": branch,
-            "remote": remote,
-            "before": before,
-            "after": after,
-        }
-
-    pull_result = _git(repo_path, "pull", "--ff-only", remote, branch)
-    if pull_result.returncode != 0:
-        return {
-            "status": "error",
-            "reason": pull_result.stderr.strip() or "git pull failed",
-            "branch": branch,
-            "remote": remote,
-            "before": before,
-            "after": after,
-        }
-
-    return {
-        "status": "updated",
-        "branch": branch,
-        "remote": remote,
-        "before": before,
-        "after": after,
-    }
 
 
 def restart_current_process() -> None:

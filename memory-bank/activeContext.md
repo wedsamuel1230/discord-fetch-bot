@@ -11,6 +11,9 @@ Post-implementation stabilization (v1.3.0): validate X discovery coverage, start
   - FxTwitter public API hydration for full tweet text/metrics
 - Added `DISCORD_INIT_WEBHOOK_URL` for boot and self-update notices.
 - Added safe daily git self-update with clean-working-tree guard and fast-forward only pulls.
+- Added Docker git dependency and graceful fallback when `git` is unavailable.
+- Deployment note: uploading source files alone is insufficient on HAOS; the `discord-bot` image must be rebuilt after code or Dockerfile changes.
+- Digest formatting now compacts AI output into short one-line Traditional Chinese bullets in a "why it matters" style before sending to Discord.
 - Expanded RSS catalog with higher-signal sources:
   - OpenAI News, Hugging Face Blog, Google AI Blog
   - Arduino Blog, Raspberry Pi News
@@ -56,5 +59,7 @@ Post-implementation stabilization (v1.3.0): validate X discovery coverage, start
 - Root cause observed: logged-in X scraping path was brittle and produced missing-post gaps in production.
 - Current mitigation: public discovery + hydration avoids account/session management entirely.
 - Self-update intentionally refuses to pull over a dirty working tree.
+- HAOS deploy flow uses `docker run` with only `/app/data` mounted, so app changes require `docker build -t discord-bot .` on the host before restart.
+- Digest embed descriptions now normalize wrapped AI output into compact single-line bullets and preserve URLs.
 
-Last Updated: 2026-03-04
+Last Updated: 2026-03-08

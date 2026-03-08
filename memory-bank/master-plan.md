@@ -17,6 +17,7 @@
 - [ ] Deploy container to HAOS host and validate next scheduled run at 13:30 HKT
 - [ ] Optional: configure proxy or residential egress for twscrape to recover direct X API access
 - [ ] Optional: replace invalid 3D feed endpoints with currently working sources
+- [ ] Optional: expand sources with GitHub releases, HN curated feeds, and YouTube channel feeds if current coverage remains thin
 
 ## Completed
 - [x] Implementation plan created (2026-03-04)

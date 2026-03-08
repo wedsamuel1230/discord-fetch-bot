@@ -49,6 +49,28 @@
 ## 2026-03-04 — v1.1.0
 **Objective:** Fix missing X posts in runtime logs and harden deployment behavior
 
+## 2026-03-08 — v1.3.1
+**Objective:** Fix HAOS startup crash caused by stale image and missing git binary
+
+**Actions:**
+- Added `git` installation to Dockerfile for self-update support in containerized deployments
+- Hardened git helper calls in `main.py` so missing git degrades to a logged skip instead of a startup crash
+- Identified HAOS deployment root cause: files were uploaded, but the `discord-bot` image was not rebuilt before `docker run`
+- Updated `upload.md` to require remote `docker build --pull -t discord-bot .` before container restart
+
+**Status:** ✅ Complete
+
+## 2026-03-08 — v1.3.2
+**Objective:** Shorten Discord digest items into one-line "why it matters" bullets
+
+**Actions:**
+- Added a focused regression test to require verbose multi-line AI bullets to collapse into single-line Discord bullets
+- Updated the OpenRouter prompt to request short Traditional Chinese "why it matters" lines instead of 1-2 sentence summaries
+- Added Discord-side normalization so wrapped or overly verbose AI output is compacted while preserving source URLs
+- Verified the focused test, full regression suite, and Python syntax check all pass
+
+**Status:** ✅ Complete
+
 **Actions:**
 - Analyzed production logs: twscrape login blocked by Cloudflare (`403`) resulting in 0 active X accounts
 - Added active-account validation in `setup_twscrape()` with explicit warning when account pool is inactive
