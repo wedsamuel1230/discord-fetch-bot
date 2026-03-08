@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Discord Daily Tech Bot
+"""Discord Daily Tech Bot.
 
 Daily tech news digest from X (Twitter) and RSS feeds, filtered and
 summarised into Traditional Chinese via OpenRouter AI, then delivered as
 6 themed Discord embeds every afternoon at 13:30 HKT.
 
 Architecture : single-file async Python app
-Data sources : twscrape (X/Twitter) + feedparser (RSS, fetched via httpx)
+Data sources : x-tweet-fetcher-style X discovery + RSS feeds via httpx/feedparser
 AI           : OpenRouter free-tier models (OpenAI-compatible REST)
-Delivery     : Discord webhook — single POST, all 7 embeds
+Delivery     : Discord webhooks for digest + init status
 Scheduler    : APScheduler AsyncIOScheduler + CronTrigger at 13:30 HKT
 
 AI model fallback chain (verify IDs at https://openrouter.ai/models):
@@ -24,16 +24,17 @@ import html
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
-from urllib.parse import quote_plus
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from urllib.parse import quote, urlparse
 
 import feedparser
 import httpx
 import pytz
-import twscrape
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -50,30 +51,18 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ─── Constants ────────────────────────────────────────────────────────────────
 HKT = pytz.timezone("Asia/Hong_Kong")
 USER_AGENT = "DiscordTechBot/1.0"
+SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/133.0.0.0 Safari/537.36"
+)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-NITTER_BASE_URLS = [
-    # 官方 instance，2025年2月重新上線並持續維護
-    "https://nitter.net",
-    # 以下為目前 wiki 確認 ✅✅ 狀態的 instances
-    "https://nitter.privacyredirect.com",
-    "https://nitter.space",
-    "https://nitter.tiekoetter.com",
-    "https://lightbrd.com",
-    "https://nuku.trabun.org",
-    "https://nitter.kuuro.net",
-    # 其他長期存活的備用
-    "https://nitter.poast.org",
-    "https://nitter.privacydev.net",
-]
-
-NITTER_TOPIC_QUERY: dict[str, str] = {
-    "AI": "AI OR LLM OR open source AI",
-    "ESP32": "ESP32 OR esp-idf",
-    "RP2040": "RP2040 OR RP2350 OR pico w OR pico 2",
-    "Arduino": "Arduino project",
-    "Maker": "maker project OR diy build",
-    "3D列印": "3D printing OR FDM OR resin print",
-}
+FXTWITTER_API_BASE = "https://api.fxtwitter.com"
+DUCKDUCKGO_HTML_SEARCH = "https://html.duckduckgo.com/html/"
+STATUS_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)"
+)
+REPO_PATH = os.environ.get("SELF_UPDATE_REPO_PATH", ".")
 
 # AI model fallback cascade — update IDs if they differ on openrouter.ai/models
 OPENROUTER_MODELS: list[str] = [
@@ -85,11 +74,8 @@ OPENROUTER_MODELS: list[str] = [
 # ─── Environment Validation ───────────────────────────────────────────────────
 _REQUIRED_ENV = [
     "DISCORD_WEBHOOK_URL",
+    "DISCORD_INIT_WEBHOOK_URL",
     "OPENROUTER_API_KEY",
-    "X_USERNAME",
-    "X_PASSWORD",
-    "X_EMAIL",
-    "X_EMAIL_PW",
 ]
 
 
@@ -112,127 +98,160 @@ def validate_env() -> dict[str, str]:
     return cfg
 
 
-def get_nitter_bases() -> list[str]:
-    """Return ordered Nitter mirrors from env override or defaults."""
-    raw = os.environ.get("NITTER_BASE_URLS", "").strip()
-    if not raw:
-        return NITTER_BASE_URLS
-    mirrors = [m.strip().rstrip("/") for m in raw.split(",") if m.strip()]
-    return mirrors or NITTER_BASE_URLS
-
-
 # ─── Topic Configuration ──────────────────────────────────────────────────────
 TOPICS: list[dict[str, Any]] = [
     {
         "name": "AI",
         "emoji": "🤖",
         "color": 0x5865F2,
-        "query": (
-            "(new AI model OR AI project OR AI tool OR AI release OR AI paper)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 20,
-        "fallback_min_faves": 5,
         "fetch_limit": 10,
-        "rss_feeds": ["hn_ai"],
+        "discover_queries": [
+            "AI agent open source model",
+            "LLM release inference benchmark",
+        ],
+        "rss_feeds": [
+            "openai_news",
+            "huggingface_blog",
+            "google_ai_blog",
+            "hn_ai",
+            "reddit_machinelearning",
+            "reddit_artificial",
+        ],
     },
     {
         "name": "ESP32",
         "emoji": "🔌",
         "color": 0x57F287,
-        "query": (
-            "ESP32 (project OR tutorial OR build OR release OR firmware OR library)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 5,
-        "fallback_min_faves": 1,
         "fetch_limit": 10,
-        "rss_feeds": ["reddit_esp32", "hackster", "adafruit"],
+        "discover_queries": [
+            "ESP32 project esp-idf firmware",
+            "ESP32 tutorial board library",
+        ],
+        "rss_feeds": [
+            "reddit_esp32",
+            "adafruit_esp32",
+            "hackaday_esp32",
+            "adafruit",
+        ],
     },
     {
         "name": "RP2040",
         "emoji": "🔌",
         "color": 0x2ECC71,
-        "query": (
-            "(RP2040 OR RP2350) (project OR tutorial OR build OR release OR firmware OR library)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 5,
-        "fallback_min_faves": 1,
         "fetch_limit": 10,
-        "rss_feeds": ["reddit_rp2040", "hackster", "adafruit"],
+        "discover_queries": [
+            "RP2040 RP2350 Pico 2 project",
+            "Raspberry Pi Pico firmware board",
+        ],
+        "rss_feeds": [
+            "reddit_rp2040",
+            "raspberry_pi_news",
+            "hackaday_rp2040",
+            "adafruit",
+        ],
     },
     {
         "name": "Arduino",
         "emoji": "🔌",
         "color": 0x00979D,
-        "query": (
-            "Arduino (project OR tutorial OR build OR shield OR library OR new)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 10,
-        "fallback_min_faves": 1,
         "fetch_limit": 10,
-        "rss_feeds": ["reddit_arduino", "hackster", "adafruit"],
+        "discover_queries": [
+            "Arduino project tutorial shield library",
+            "Arduino build release maker",
+        ],
+        "rss_feeds": [
+            "reddit_arduino",
+            "arduino_blog",
+            "adafruit",
+        ],
     },
     {
         "name": "Maker",
         "emoji": "🛠️",
         "color": 0xFEE75C,
-        "query": (
-            "(maker project OR DIY build OR hackaday OR hackspace OR makerspace)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 10,
-        "fallback_min_faves": 1,
         "fetch_limit": 10,
-        "rss_feeds": ["hackaday", "adafruit", "reddit_maker"],
+        "discover_queries": [
+            "maker project diy electronics build",
+            "hackaday makerspace fabrication tutorial",
+        ],
+        "rss_feeds": [
+            "hackaday",
+            "adafruit",
+            "adafruit_learning",
+            "makezine",
+            "reddit_maker",
+            "reddit_diy",
+            "reddit_electronics",
+        ],
     },
     {
         "name": "3D列印",
         "emoji": "🖨️",
         "color": 0xED4245,
-        "query": (
-            "(3Dprinting OR 3Dprint OR FDM OR resin print)"
-            " (project OR model OR build OR release)"
-            " -is:retweet -is:reply"
-        ),
-        "min_faves": 10,
-        "fallback_min_faves": 1,
         "fetch_limit": 10,
-        "rss_feeds": ["reddit_3dprinting", "printables", "thingiverse"],
+        "discover_queries": [
+            "3D printing FDM resin print release",
+            "3D printer model slicer filament",
+        ],
+        "rss_feeds": [
+            "reddit_3dprinting",
+            "prusa_blog",
+            "3dprintingindustry",
+            "voxelmatters",
+            "3dnatives",
+            "hackaday_3dprinting",
+        ],
     },
 ]
 
 # ─── RSS Feed Configuration ───────────────────────────────────────────────────
 RSS_FEEDS: dict[str, str] = {
-    "hackaday":          "https://hackaday.com/blog/feed/",
-    "hackster":          "https://www.hackster.io/feed",
-    "adafruit":          "https://blog.adafruit.com/feed/",
-    "printables":        "https://www.printables.com/feed.xml",
-    "thingiverse":       "https://www.thingiverse.com/newest/rss",
-    "hn_ai":             "https://hnrss.org/newest?q=AI+LLM&points=10",
-    "reddit_esp32":      "https://www.reddit.com/r/esp32/.rss",
-    "reddit_arduino":    "https://www.reddit.com/r/arduino/.rss",
-    "reddit_rp2040":     "https://www.reddit.com/r/RP2040/.rss",
+    "openai_news": "https://openai.com/news/rss.xml",
+    "huggingface_blog": "https://huggingface.co/blog/feed.xml",
+    "google_ai_blog": "https://blog.google/technology/ai/rss/",
+    "hn_ai": "https://hnrss.org/newest?q=AI+LLM&points=10",
+    "reddit_machinelearning": "https://www.reddit.com/r/MachineLearning/.rss",
+    "reddit_artificial": "https://www.reddit.com/r/artificial/.rss",
+    "arduino_blog": "https://blog.arduino.cc/feed/",
+    "raspberry_pi_news": "https://www.raspberrypi.com/news/feed/",
+    "adafruit": "https://blog.adafruit.com/feed/",
+    "adafruit_esp32": "https://blog.adafruit.com/category/esp32/feed/",
+    "adafruit_learning": "https://learn.adafruit.com/feed",
+    "hackaday": "https://hackaday.com/blog/feed/",
+    "hackaday_esp32": "https://hackaday.com/tag/esp32/feed/",
+    "hackaday_rp2040": "https://hackaday.com/tag/rp2040/feed/",
+    "hackaday_3dprinting": "https://hackaday.com/tag/3d-printing/feed/",
+    "makezine": "https://makezine.com/feed/",
+    "reddit_esp32": "https://www.reddit.com/r/esp32/.rss",
+    "reddit_arduino": "https://www.reddit.com/r/arduino/.rss",
+    "reddit_rp2040": "https://www.reddit.com/r/RP2040/.rss",
+    "reddit_maker": "https://www.reddit.com/r/maker/.rss",
+    "reddit_diy": "https://www.reddit.com/r/DIY/.rss",
+    "reddit_electronics": "https://www.reddit.com/r/electronics/.rss",
     "reddit_3dprinting": "https://www.reddit.com/r/3Dprinting/.rss",
-    "reddit_maker":      "https://www.reddit.com/r/maker/.rss",
+    "prusa_blog": "https://blog.prusa3d.com/feed/",
+    "3dprintingindustry": "https://3dprintingindustry.com/feed/",
+    "voxelmatters": "https://www.voxelmatters.com/feed/",
+    "3dnatives": "https://www.3dnatives.com/en/feed/",
 }
 
 RSS_FEED_FALLBACKS: dict[str, list[str]] = {
-    # Primary URLs are user-requested; fallback URLs keep data flowing if primaries fail.
-    "printables": ["https://blog.prusa3d.com/feed/"],
-    "thingiverse": ["https://www.thingiverse.com/rss"],
+    "google_ai_blog": ["https://ai.googleblog.com/feeds/posts/default"],
 }
 
-# Hackster and Adafruit cover multiple topics — keyword match determines assignment
-_MULTI_TOPIC_FEEDS: frozenset[str] = frozenset({"hackster", "adafruit"})
+# Broad feeds span multiple topics — keyword match determines assignment.
+_MULTI_TOPIC_FEEDS: frozenset[str] = frozenset({
+    "adafruit",
+    "hackaday",
+    "makezine",
+    "raspberry_pi_news",
+})
 
 _MULTI_TOPIC_KEYWORDS: dict[str, list[str]] = {
     "ESP32":  ["esp32", "esp-32", "esp-idf"],
-    "RP2040": ["rp2040", "rp2350", "pico w", "pico 2", "raspberry pi pico", "circuitpython"],
+    "RP2040": ["rp2040", "rp2350", "pico w", "pico 2", "raspberry pi pico", "circuitpython", "rp-series"],
     "Arduino": ["arduino"],
-    "Maker":  ["maker", "diy", "hack", "makerspace"],
+    "Maker":  ["maker", "diy", "hack", "makerspace", "electronics", "project"],
     "3D列印": ["3d print", "3dprint", "fdm", "resin", "filament", "sla"],
 }
 
@@ -260,153 +279,295 @@ def _entry_datetime(entry: Any) -> Optional[datetime]:
     return None
 
 
-# ─── T2: twscrape — Account Setup ─────────────────────────────────────────────
+# ─── T2/T3: X Discovery + FxTwitter Hydration ────────────────────────────────
 
-async def setup_twscrape(cfg: dict[str, str]) -> twscrape.API:
-    """Initialise twscrape; add account + login on first run, reuse session after."""
-    os.makedirs("data", exist_ok=True)
-    api = twscrape.API("data/accounts.db")
+def _normalize_x_status_url(url: str) -> Optional[str]:
+    match = STATUS_URL_RE.search((url or "").strip())
+    if not match:
+        return None
+    return f"https://x.com/{match.group(1)}/status/{match.group(2)}"
+
+
+def _normalize_public_x_url(url: str) -> Optional[str]:
+    candidate = html.unescape((url or "").strip()).rstrip(").,/")
+    status_url = _normalize_x_status_url(candidate)
+    if status_url:
+        return status_url
+
     try:
-        accounts = await api.pool.get_all()
-        if not accounts:
-            log.info("twscrape: no accounts — adding account and logging in…")
-            await api.pool.add_account(
-                username=cfg["X_USERNAME"],
-                password=cfg["X_PASSWORD"],
-                email=cfg["X_EMAIL"],
-                email_password=cfg["X_EMAIL_PW"],
-            )
-            await api.pool.login_all()
-            refreshed = await api.pool.get_all()
-            active_count = sum(1 for a in refreshed if getattr(a, "active", False))
-            if active_count == 0:
-                log.warning(
-                    "twscrape login finished but no active accounts (likely Cloudflare/IP block). "
-                    "X fetch will use Nitter fallback."
-                )
-            else:
-                log.info("✅ twscrape login complete — active accounts: %d", active_count)
-        else:
-            active_count = sum(1 for a in accounts if getattr(a, "active", False))
-            log.info(
-                "✅ twscrape: reusing %d account(s), active=%d",
-                len(accounts),
-                active_count,
-            )
-    except Exception as exc:
-        log.error("twscrape setup error: %s", exc)
-        raise
-    return api
+        parsed = urlparse(candidate)
+    except Exception:
+        return None
+
+    if parsed.netloc not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+        return None
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if len(segments) != 1:
+        return None
+    handle = segments[0]
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+        return None
+    return f"https://x.com/{handle}"
 
 
-# ─── T3: Tweet Fetching ────────────────────────────────────────────────────────
-
-async def fetch_tweets(
-    api: twscrape.API, topic: dict[str, Any], client: Optional[httpx.AsyncClient] = None
-) -> list[dict[str, Any]]:
-    """Search X for a topic; fallback to Nitter RSS if twscrape yields too few posts."""
-
-    async def _search(query: str) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        try:
-            async for tweet in api.search(query, limit=topic["fetch_limit"]):
-                results.append(
-                    {
-                        "source": "x",
-                        "author": tweet.user.username,
-                        "content": tweet.rawContent,
-                        "url": tweet.url,
-                        "like_count": tweet.likeCount,
-                    }
-                )
-        except Exception as exc:
-            log.warning("Tweet fetch error (%s): %s", topic["name"], exc)
-        return results
-
-    primary_q = f"{topic['query']} min_faves:{topic['min_faves']}"
-    tweets = await _search(primary_q)
-
-    if len(tweets) < 3:
-        log.info(
-            "%s: primary → %d tweets; retry with min_faves=%d",
-            topic["name"],
-            len(tweets),
-            topic["fallback_min_faves"],
-        )
-        fallback_q = f"{topic['query']} min_faves:{topic['fallback_min_faves']}"
-        tweets = await _search(fallback_q)
-
-    if len(tweets) < 3 and client is not None:
-        nitter_posts = await _fetch_tweets_via_nitter(client, topic)
-        seen = {t.get("url", "") for t in tweets}
-        for post in nitter_posts:
-            if post["url"] not in seen:
-                tweets.append(post)
-                seen.add(post["url"])
-        if nitter_posts:
-            log.info(
-                "%s: added %d X posts via Nitter fallback",
-                topic["name"],
-                len(nitter_posts),
-            )
-
-    log.info("%s: %d tweets from X", topic["name"], len(tweets))
-    return tweets
+def _discover_query_strings(topic: dict[str, Any]) -> list[str]:
+    queries = topic.get("discover_queries") or []
+    return queries if queries else [topic.get("name", "technology")]
 
 
-async def _fetch_tweets_via_nitter(
-    client: httpx.AsyncClient, topic: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Fetch X-like posts through Nitter search RSS as fallback when twscrape is blocked."""
-    # Keep query broad for RSS compatibility; nitter doesn't understand all X operators.
-    raw_query = NITTER_TOPIC_QUERY.get(topic["name"], topic["name"])
-    q = quote_plus(raw_query)
-
-    for base in get_nitter_bases():
-        url = f"{base}/search/rss?f=tweets&q={q}"
-        try:
-            resp = await client.get(
-                url,
-                headers={"User-Agent": USER_AGENT},
-                timeout=20.0,
-                follow_redirects=True,
+def _discover_via_duckduckgo_html(query: str, limit: int) -> list[dict[str, str]]:
+    try:
+        with httpx.Client(follow_redirects=True, timeout=20.0) as client:
+            resp = client.post(
+                DUCKDUCKGO_HTML_SEARCH,
+                data={"q": query},
+                headers={"User-Agent": SEARCH_USER_AGENT},
             )
             resp.raise_for_status()
-            parsed = feedparser.parse(resp.text)
-            if parsed.get("bozo"):
-                log.warning(
-                    "Nitter bozo flag [%s]: %s",
-                    base,
-                    parsed.get("bozo_exception", "unknown"),
-                )
+    except Exception as exc:
+        log.warning("DuckDuckGo HTML discovery failed [%s]: %s", query, exc)
+        return []
 
-            if "cloudflare" in resp.text.lower() or "blocked" in resp.text.lower():
-                log.warning("Nitter mirror appears blocked [%s]", base)
+    matches = re.findall(
+        r'https?://(?:www\.)?(?:x|twitter)\.com/[^"\'&<> ]+',
+        resp.text,
+    )
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_url in matches:
+        normalized = _normalize_public_x_url(raw_url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append({"url": normalized, "title": query, "snippet": query})
+        if len(results) >= limit:
+            break
+    return results
 
-            posts: list[dict[str, Any]] = []
-            for entry in list(parsed.entries)[: topic.get("fetch_limit", 10)]:
-                title = strip_html(getattr(entry, "title", "") or "", 300)
-                link = getattr(entry, "link", "") or ""
-                author = strip_html(getattr(entry, "author", "") or "nitter", 100)
-                if link:
-                    posts.append(
+
+def _discover_via_ddgs(query: str, limit: int) -> list[dict[str, str]]:
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        return []
+
+    results: list[dict[str, str]] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            with DDGS() as ddgs:
+                for result in ddgs.text(query, max_results=max(limit, 1)):
+                    normalized = _normalize_public_x_url(
+                        result.get("url") or result.get("href") or ""
+                    )
+                    if not normalized:
+                        continue
+                    results.append(
                         {
-                            "source": "x",
-                            "author": author,
-                            "content": title,
-                            "url": link,
-                            "like_count": 0,
+                            "url": normalized,
+                            "title": (result.get("title") or "").strip(),
+                            "snippet": (result.get("body") or result.get("snippet") or "").strip(),
                         }
                     )
-
-            if posts:
-                log.info("Nitter fallback success [%s]: %d posts", base, len(posts))
-                return posts
-            log.warning("Nitter fallback [%s] returned 0 entries for query '%s'", base, raw_query)
         except Exception as exc:
-            log.warning("Nitter fallback failed [%s]: %s", base, exc)
+            log.warning("DDGS discovery failed [%s]: %s", query, exc)
+    return results
 
-    return []
+
+def _discover_via_google_news_rss(query: str, limit: int) -> list[dict[str, str]]:
+    search_url = (
+        "https://news.google.com/rss/search?q="
+        f"{quote(f'site:x.com {query}')}&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        parsed = feedparser.parse(search_url)
+    except Exception as exc:
+        log.warning("Google News RSS discovery failed [%s]: %s", query, exc)
+        return []
+
+    results: list[dict[str, str]] = []
+    for entry in parsed.entries:
+        source = getattr(entry, "source", {}) or {}
+        source_title = str(source.get("title") or "")
+        if source_title.lower() != "x.com":
+            continue
+
+        raw_title = strip_html(getattr(entry, "title", "") or "", 280)
+        title = raw_title.removesuffix(" - x.com").strip()
+        if not title:
+            continue
+
+        handle_match = re.search(r"\(@([A-Za-z0-9_]{1,15})\)", title)
+        if handle_match:
+            url = f"https://x.com/{handle_match.group(1)}"
+        else:
+            url = getattr(entry, "link", "") or ""
+
+        results.append({"url": url, "title": title, "snippet": title})
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def discover_x_urls(topic: dict[str, Any], limit: int = 10) -> list[dict[str, str]]:
+    """Discover X status URLs using the same search-first strategy as x-tweet-fetcher."""
+    seen: set[str] = set()
+    discovered: list[dict[str, str]] = []
+    per_query_limit = max(limit, 1)
+
+    for query in _discover_query_strings(topic):
+        query_variants = [
+            f"site:x.com {query}",
+            f"site:twitter.com {query}",
+            f"{query} x.com",
+        ]
+        for search_query in query_variants:
+            for result in _discover_via_duckduckgo_html(search_query, per_query_limit):
+                if result["url"] in seen:
+                    continue
+                seen.add(result["url"])
+                discovered.append(result)
+                if len(discovered) >= limit:
+                    return discovered
+            if len(discovered) >= limit:
+                return discovered
+
+        for result in _discover_via_google_news_rss(query, per_query_limit):
+            if result["url"] in seen:
+                continue
+            seen.add(result["url"])
+            discovered.append(result)
+            if len(discovered) >= limit:
+                return discovered
+
+        for search_query in query_variants:
+            for result in _discover_via_ddgs(search_query, per_query_limit):
+                if result["url"] in seen:
+                    continue
+                seen.add(result["url"])
+                discovered.append(result)
+                if len(discovered) >= limit:
+                    return discovered
+
+    return discovered
+
+
+async def fetch_fxtwitter_tweet(
+    client: httpx.AsyncClient, url: str
+) -> Optional[dict[str, Any]]:
+    """Hydrate a discovered X status URL using FxTwitter's public API."""
+    normalized = _normalize_x_status_url(url)
+    if not normalized:
+        return None
+
+    match = STATUS_URL_RE.search(normalized)
+    if not match:
+        return None
+
+    username, tweet_id = match.groups()
+    api_url = f"{FXTWITTER_API_BASE}/{username}/status/{tweet_id}"
+
+    try:
+        resp = await client.get(
+            api_url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        log.warning("FxTwitter fetch failed [%s]: %s", normalized, exc)
+        return None
+
+    if payload.get("code") != 200:
+        log.warning(
+            "FxTwitter returned code %s for %s",
+            payload.get("code"),
+            normalized,
+        )
+        return None
+
+    tweet = payload.get("tweet") or {}
+    author = (tweet.get("author") or {}).get("screen_name") or username
+    content = strip_html(tweet.get("text") or "", 500)
+    if not content:
+        return None
+
+    return {
+        "source": "x",
+        "author": author,
+        "content": content,
+        "url": normalized,
+        "like_count": int(tweet.get("likes") or 0),
+        "retweet_count": int(tweet.get("retweets") or 0),
+        "view_count": int(tweet.get("views") or 0),
+        "created_at": tweet.get("created_at") or "",
+    }
+
+
+def _fallback_discovered_post(result: dict[str, str]) -> Optional[dict[str, Any]]:
+    raw_url = result.get("url", "")
+    normalized = _normalize_public_x_url(raw_url)
+    final_url = normalized or raw_url
+    if not final_url:
+        return None
+
+    author = "x"
+    if normalized:
+        parsed = urlparse(normalized)
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if segments:
+            author = segments[0]
+
+    title = result.get("title") or ""
+    handle_match = re.search(r"\(@([A-Za-z0-9_]{1,15})\)", title)
+    if author == "x" and handle_match:
+        author = handle_match.group(1)
+
+    content = strip_html(result.get("snippet") or title, 280)
+    if not content:
+        return None
+
+    return {
+        "source": "x",
+        "author": author,
+        "content": content,
+        "url": final_url,
+        "like_count": 0,
+    }
+
+
+async def fetch_tweets(
+    _unused_api: Any, topic: dict[str, Any], client: Optional[httpx.AsyncClient] = None
+) -> list[dict[str, Any]]:
+    """Discover public X posts and hydrate them via FxTwitter."""
+    if client is None:
+        return []
+
+    discovered = discover_x_urls(topic, limit=topic["fetch_limit"])
+    posts: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for result in discovered:
+        post = await fetch_fxtwitter_tweet(client, result["url"])
+        if post is None:
+            post = _fallback_discovered_post(result)
+        if not post:
+            continue
+        if post["url"] in seen_urls:
+            continue
+        posts.append(post)
+        seen_urls.add(post["url"])
+
+    log.info(
+        "%s: %d discovered X posts (queries=%d)",
+        topic["name"],
+        len(posts),
+        len(_discover_query_strings(topic)),
+    )
+    return posts
 
 
 # ─── T3b: RSS Feed Fetching ────────────────────────────────────────────────────
@@ -779,13 +940,150 @@ async def send_to_discord(
         return False
 
 
+async def send_init_message(
+    client: httpx.AsyncClient,
+    cfg: dict[str, str],
+    branch: str,
+    remote: str,
+    rss_feed_count: int,
+) -> bool:
+    """Send a startup/init status message to a separate Discord webhook."""
+    content = (
+        f"Bot init | branch={branch or 'unknown'} remote={remote or 'origin'} "
+        f"rss_feeds={rss_feed_count} topics={len(TOPICS)} "
+        f"startup_run={str(_env_bool('RUN_ON_STARTUP', False)).lower()}"
+    )
+
+    try:
+        resp = await client.post(
+            cfg["DISCORD_INIT_WEBHOOK_URL"],
+            json={"content": content},
+            headers={"Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        if resp.status_code in (200, 204):
+            log.info("✅ Init webhook delivered")
+            return True
+        log.warning("Init webhook failed: HTTP %d", resp.status_code)
+        return False
+    except Exception as exc:
+        log.warning("Init webhook exception: %s", exc)
+        return False
+
+
+def _git(repo_path: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", repo_path, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def get_repo_tracking(repo_path: str = REPO_PATH) -> tuple[str, str]:
+    branch_result = _git(repo_path, "branch", "--show-current")
+    branch = branch_result.stdout.strip() or os.environ.get("SELF_UPDATE_BRANCH", "main")
+    remote = os.environ.get("SELF_UPDATE_REMOTE", "origin")
+    return branch, remote
+
+
+def check_and_apply_repo_update(repo_path: str = REPO_PATH) -> dict[str, Any]:
+    """Fast-forward local repo to the configured remote branch when safe."""
+    branch, remote = get_repo_tracking(repo_path)
+    dirty_result = _git(repo_path, "status", "--short")
+    dirty = dirty_result.stdout.strip()
+    if dirty:
+        return {
+            "status": "skipped",
+            "reason": "working tree is dirty",
+            "branch": branch,
+            "remote": remote,
+        }
+
+    fetch_result = _git(repo_path, "fetch", remote, branch)
+    if fetch_result.returncode != 0:
+        return {
+            "status": "error",
+            "reason": fetch_result.stderr.strip() or "git fetch failed",
+            "branch": branch,
+            "remote": remote,
+        }
+
+    before = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    after = _git(repo_path, "rev-parse", f"{remote}/{branch}").stdout.strip()
+    if not before or not after:
+        return {
+            "status": "error",
+            "reason": "unable to resolve git revisions",
+            "branch": branch,
+            "remote": remote,
+        }
+    if before == after:
+        return {
+            "status": "up-to-date",
+            "branch": branch,
+            "remote": remote,
+            "before": before,
+            "after": after,
+        }
+
+    pull_result = _git(repo_path, "pull", "--ff-only", remote, branch)
+    if pull_result.returncode != 0:
+        return {
+            "status": "error",
+            "reason": pull_result.stderr.strip() or "git pull failed",
+            "branch": branch,
+            "remote": remote,
+            "before": before,
+            "after": after,
+        }
+
+    return {
+        "status": "updated",
+        "branch": branch,
+        "remote": remote,
+        "before": before,
+        "after": after,
+    }
+
+
+def restart_current_process() -> None:
+    """Restart the current Python process after a successful self-update."""
+    log.info("Restarting process to load updated code")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+async def maybe_apply_repo_update(
+    client: httpx.AsyncClient, cfg: dict[str, str]
+) -> dict[str, Any]:
+    if not _env_bool("SELF_UPDATE_ENABLED", default=True):
+        return {"status": "skipped", "reason": "self-update disabled"}
+
+    result = await asyncio.to_thread(check_and_apply_repo_update, REPO_PATH)
+    status = result.get("status")
+    if status == "updated":
+        await client.post(
+            cfg["DISCORD_INIT_WEBHOOK_URL"],
+            json={
+                "content": (
+                    f"Bot update applied | branch={result['branch']} "
+                    f"{result['before'][:7]}->{result['after'][:7]}"
+                )
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        restart_current_process()
+    return result
+
+
 # ─── T7: Orchestrator ─────────────────────────────────────────────────────────
 
-async def run_daily_job(cfg: dict[str, str], tw_api: twscrape.API) -> None:
+async def run_daily_job(cfg: dict[str, str]) -> None:
     """
     Full daily pipeline:
       1. Fetch all RSS feeds concurrently (single batch).
-      2. For each of 7 topics: fetch X tweets + merge RSS + AI filter.
+    2. For each topic: fetch X tweets + merge RSS + AI filter.
       3. Build all 7 embeds and POST to Discord.
 
     Each topic is error-isolated — individual failures produce an error embed,
@@ -808,7 +1106,7 @@ async def run_daily_job(cfg: dict[str, str], tw_api: twscrape.API) -> None:
         for topic in TOPICS:
             try:
                 rss_posts = get_rss_for_topic(all_rss, topic)
-                tweets = await fetch_tweets(tw_api, topic, client)
+                tweets = await fetch_tweets(None, topic, client)
 
                 # Merge: RSS first (higher quality), X after; deduplicate by URL
                 seen_urls: set[str] = set()
@@ -856,6 +1154,9 @@ async def run_daily_job(cfg: dict[str, str], tw_api: twscrape.API) -> None:
         # Phase 3 — deliver
         embeds = build_all_embeds(results)
         await send_to_discord(client, embeds, cfg)
+        update_result = await maybe_apply_repo_update(client, cfg)
+        if update_result.get("status") not in {"up-to-date", "skipped"}:
+            log.info("Self-update result: %s", update_result)
 
     elapsed = time.monotonic() - start
     log.info("═══ Daily job complete in %.1fs ═══", elapsed)
@@ -870,11 +1171,19 @@ async def main() -> None:
     # T10: startup validation (fail fast if env vars missing)
     cfg = validate_env()
 
-    # T2: twscrape account setup
-    tw_api = await setup_twscrape(cfg)
+    branch, remote = get_repo_tracking(REPO_PATH)
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        await send_init_message(
+            client,
+            cfg,
+            branch=branch,
+            remote=remote,
+            rss_feed_count=len(RSS_FEEDS),
+        )
 
     async def _job() -> None:
-        await run_daily_job(cfg, tw_api)
+        await run_daily_job(cfg)
 
     run_on_startup = _env_bool("RUN_ON_STARTUP", default=False)
     if run_on_startup:
