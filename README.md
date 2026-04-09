@@ -138,7 +138,8 @@ Models are tried in order; if one fails the next is attempted:
 - **Follow-builders failover:** The bot tries configured `FOLLOW_BUILDERS_BASE_URLS` in order for each feed and can use local cache fallback when all upstream candidates fail temporarily.
 - **Broad feeds are keyword-routed:** Adafruit, Hackaday, Make:, and Raspberry Pi News span multiple topics and are assigned by title/summary keyword matching.
 - **Discord 6000-char limit:** Enforced at embed build time — longest descriptions are trimmed if total exceeds 5800 chars per Discord guidelines.
-- **Single file:** All bot logic in `main.py` (~600 lines); async architecture with APScheduler 3.x for scheduling.
+- **Single file:** All bot logic remains centralized in `main.py` (~2200+ lines); async architecture with APScheduler 3.x for scheduling.
+- **Curation references:** New long-form source curation lists are kept in `memory-bank/ref/youtuber-to-add.md`, `memory-bank/ref/youtuber-to-add-grok.md`, and `memory-bank/ref/xer-to-add.md`; recent implementation notes are archived under `memory-bank/logs/`.
 
 ---
 
