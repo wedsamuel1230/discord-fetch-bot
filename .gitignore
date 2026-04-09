@@ -4,6 +4,7 @@
 # twscrape session database (contains auth cookies)
 data/accounts.db
 data/*.db
+data/follow_builders_cache.json
 
 # Python
 __pycache__/

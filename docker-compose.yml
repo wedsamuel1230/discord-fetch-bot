@@ -4,5 +4,5 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      # Persist twscrape session (accounts.db) across container restarts
+      # Persist runtime state (cache/history/artifacts) across container restarts
       - ./data:/app/data

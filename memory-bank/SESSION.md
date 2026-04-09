@@ -105,4 +105,133 @@
 
 **Status:** ✅ Complete
 
+## 2026-03-29 — v1.4.0
+
+**Objective:** Start follow-builders hybrid migration implementation
+
+**Actions:**
+
+- Added migration toggles and config guards (`DIGEST_MODE`, follow-builders source mode, pinned ref requirement)
+- Implemented follow-builders feed intake normalization (`feed-x`, `feed-podcasts`, `feed-blogs`)
+- Implemented AI-builder summary renderer with identity + URL-preserving compact bullets
+- Updated orchestrator to support `follow-builders-hybrid` and `follow-builders-only` execution paths
+- Added regression tests for migration config validation, feed normalization/error surfacing, AI summary rendering, and hybrid mode orchestration
+- Updated `.env.example`, `README.md`, Docker comments, and active context docs for migration settings
+- Verified full regression suite (`python -m unittest tests.test_main -v`) and syntax compile checks
+
+**Status:** ✅ Complete
+
+## 2026-03-29 — v1.5.0
+
+**Objective:** Remove legacy X path and Maker category; redistribute feeds and expand RSS coverage
+
+**Actions:**
+
+- Removed legacy X ingestion code from `main.py` (DuckDuckGo/X discovery + FxTwitter hydration helpers deleted)
+- Removed support for `DIGEST_MODE=legacy`; valid modes are now follow-builders only (`follow-builders-hybrid`, `follow-builders-only`)
+- Removed Maker topic from category configuration and redistributed Maker feeds to ESP32/RP2040/Arduino/3D categories
+- Added extra RSS feeds: `reddit_localllama`, `reddit_singularity`, `reddit_microcontrollers`, `reddit_embedded`, `all3dp`, `reddit_additivemanufacturing`
+- Removed obsolete dependency `duckduckgo-search` from `requirements.txt`
+- Updated README + `.env.example` to reflect mode changes and category/feed updates
+- Added/updated regression tests to enforce legacy-mode rejection, helper removal, feed redistribution, and new RSS keys
+- Verified full regression suite (`python -m unittest tests.test_main -v`) passes with 13 tests green
+
+**Status:** ✅ Complete
+
+## 2026-03-29 — v1.5.1
+
+**Objective:** Ensure full Traditional Chinese output for the AI builder section
+
+**Actions:**
+
+- Added follow-builders payload conversion into `ai_filter` input posts in `main.py`
+- Updated orchestrator to summarize AI builder content via OpenRouter Traditional Chinese path
+- Kept deterministic local fallback summary when model output is empty
+- Updated hybrid orchestrator test to assert AI section goes through `ai_filter`
+- Verified full regression suite remains green (`python -m unittest tests.test_main -v`, 13/13)
+
+**Status:** ✅ Complete
+
+## 2026-03-31 — v1.6.0
+
+**Objective:** Enforce >=10 Xers per category and target 10 digest items per category
+
+**Actions:**
+
+- Added RED tests requiring:
+  - every topic has at least 10 `x_handles`
+  - AI topic includes requested handles (`Khazix0918`, `dotey`, `vista8`)
+- Captured RED evidence with focused run in configured Python env:
+  - `python -m unittest tests.test_main.TopicDistributionTests -v` failed before implementation
+- Added `x_handles` catalogs to all categories in `main.py` (>=10 each)
+- Added topic-X ingestion pipeline using RSS mirrors:
+  - `TOPIC_X_ENABLED`, `TOPIC_X_LOOKBACK_HOURS`, `TOPIC_X_RSS_BASE_URLS`
+  - per-handle fetch + per-topic merge path (`topic-X + RSS`)
+- Updated non-AI hybrid orchestration to merge topic-X posts with RSS before summarization
+- Updated `ai_filter` to target `fetch_limit` items (10 default) and adjusted char budget logic
+- Captured GREEN evidence:
+  - focused suite passes after implementation
+  - full suite passes: `python -m unittest tests.test_main -v` (15/15)
+- Updated operator docs:
+  - `.env.example` with new topic-X env knobs
+  - `README.md` with category-X and 10-item digest behavior
+
+**Status:** ✅ Complete
+
+## 2026-03-31 — v1.6.1
+
+**Objective:** Fix init-webhook behavior and harden follow-builders sourcing for resilience/performance
+
+**Actions:**
+
+- Added RED tests for:
+  - init message fallback to `DISCORD_WEBHOOK_URL` when init webhook is missing
+  - env validation acceptance when `DISCORD_INIT_WEBHOOK_URL` is absent
+  - follow-builders mirror failover across base URLs
+  - follow-builders cache fallback when all upstream candidates fail
+- Captured RED evidence:
+  - focused test run failed before implementation (`InitWebhookTests`, `MigrationConfigTests`, `FollowBuildersFeedTests`)
+- Implemented runtime behavior updates:
+  - `DISCORD_INIT_WEBHOOK_URL` is no longer required at validation time
+  - `send_init_message()` now falls back to main webhook when init webhook is empty
+  - added `FOLLOW_BUILDERS_BASE_URLS` with candidate failover per feed
+  - added local follow-builders cache controls (`FOLLOW_BUILDERS_CACHE_ENABLED`, `FOLLOW_BUILDERS_CACHE_TTL_HOURS`, `FOLLOW_BUILDERS_CACHE_PATH`)
+  - AI path now falls back to AI RSS sources when follow-builders returns empty payload
+  - added extra AI RSS fallback channels: `reddit_openai`, `reddit_chatgpt`
+- Updated operator docs in `.env.example` and `README.md`
+- Captured GREEN evidence:
+  - focused suite passes (8/8)
+  - full regression suite passes (`python -m unittest tests.test_main -v`, 19/19)
+
+**Status:** ✅ Complete
+
+## 2026-04-10 — v1.7.0
+
+**Objective:** Start implementation of staged source expansion (X + YouTube) and Discord message refactor.
+
+**Actions:**
+
+- Added RED tests for rollout and Discord output behavior (`SourceRolloutTests`, new `DigestFormatTests` checks)
+- Implemented source rollout controls:
+  - `SOURCE_ROLLOUT_MODE` (`wave1`/`wave2`)
+  - runtime overlay helpers for per-topic X and YouTube sources
+- Implemented YouTube ingestion path for non-AI hybrid categories:
+  - channel seed normalization and channel-id resolution
+  - YouTube feed fetch + recency filtering
+  - merged pipeline now: topic-X + YouTube + RSS
+- Refactored Discord composition:
+  - split compacting into helper stages
+  - centralized render limits
+  - deterministic topic ordering in embed assembly
+  - visible bullet style updated to `body ｜ URL`
+- Updated docs:
+  - `.env.example` with rollout/YouTube controls
+  - `README.md` with wave rollout and YouTube ingestion notes
+- Verification:
+  - focused RED observed before implementation
+  - focused GREEN after changes
+  - full regression GREEN: `python -m unittest tests.test_main -v` (26/26)
+
+**Status:** ✅ Complete
+
 ---

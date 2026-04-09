@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY . .
 
-# Persistent volume for twscrape accounts.db
+# Persistent volume for runtime state (cache/history/artifacts)
 VOLUME /app/data
 
 CMD ["python", "main.py"]
